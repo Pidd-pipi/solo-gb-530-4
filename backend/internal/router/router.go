@@ -20,6 +20,7 @@ type handlers struct {
 	plans       *handler.WorkPermitPlanHandler
 	exposures   *handler.ExposureEntryHandler
 	assessments *handler.DoseBudgetAssessmentHandler
+	occupations *handler.BudgetOccupationHandler
 	auth        *service.AuthService
 }
 
@@ -41,6 +42,7 @@ func New(db *gorm.DB, cfg config.Config) *gin.Engine {
 	registerWorkPermitPlanRoutes(protected, wired.plans)
 	registerExposureEntryRoutes(protected, wired.exposures)
 	registerDoseBudgetAssessmentRoutes(protected, wired.assessments)
+	registerBudgetOccupationRoutes(protected, wired.occupations)
 	protected.GET("/audit", middleware.RBAC(constants.RoleRPOReviewer, constants.RoleAdmin), wired.system.Audit)
 	engine.NoRoute(func(context *gin.Context) {
 		context.JSON(http.StatusNotFound, gin.H{
@@ -56,15 +58,20 @@ func wire(db *gorm.DB, cfg config.Config) handlers {
 	planRepository := repository.NewWorkPermitPlanRepository(db)
 	exposureRepository := repository.NewExposureEntryRepository(db)
 	assessmentRepository := repository.NewDoseBudgetAssessmentRepository(db)
+	occupationRepository := repository.NewBudgetOccupationRepository(db)
 	systemRepository := repository.NewSystemRepository(db)
 	auditService := service.NewAuditService(systemRepository)
 	authService := service.NewAuthService(systemRepository, cfg.JWTSecret, cfg.JWTTTL)
 	workerService := service.NewWorkerProfileService(workerRepository, auditService)
-	planService := service.NewWorkPermitPlanService(planRepository, workerRepository, assessmentRepository, auditService)
+	occupationService := service.NewBudgetOccupationService(
+		db, occupationRepository, planRepository, workerRepository, assessmentRepository,
+		auditService, cfg.Thresholds.NearLegalRatio, cfg.Thresholds.Version,
+	)
+	planService := service.NewWorkPermitPlanService(db, planRepository, workerRepository, assessmentRepository, occupationService, auditService)
 	exposureService := service.NewExposureEntryService(db, exposureRepository, workerRepository, auditService)
 	assessmentService := service.NewDoseBudgetAssessmentService(
-		db, assessmentRepository, planRepository, workerRepository, exposureRepository, auditService,
-		cfg.Thresholds.NearLegalRatio, cfg.Thresholds.Version,
+		db, assessmentRepository, planRepository, workerRepository, exposureRepository,
+		occupationService, auditService, cfg.Thresholds.NearLegalRatio, cfg.Thresholds.Version,
 	)
 	return handlers{
 		system:      handler.NewSystemHandler(authService, auditService, db),
@@ -72,6 +79,7 @@ func wire(db *gorm.DB, cfg config.Config) handlers {
 		plans:       handler.NewWorkPermitPlanHandler(planService),
 		exposures:   handler.NewExposureEntryHandler(exposureService),
 		assessments: handler.NewDoseBudgetAssessmentHandler(assessmentService),
+		occupations: handler.NewBudgetOccupationHandler(occupationService),
 		auth:        authService,
 	}
 }

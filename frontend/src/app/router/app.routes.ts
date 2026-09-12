@@ -23,6 +23,7 @@ export const routes: Routes = [
   { path: 'plans', canActivate: [authGuard], loadComponent: () => import('../pages/plans.page').then(module => module.PlansPage) },
   { path: 'exposures', canActivate: [authGuard], loadComponent: () => import('../pages/exposures.page').then(module => module.ExposuresPage) },
   { path: 'budgets', canActivate: [authGuard], loadComponent: () => import('../pages/budgets.page').then(module => module.BudgetsPage) },
+  { path: 'occupations', canActivate: [authGuard], loadComponent: () => import('../pages/occupations.page').then(module => module.OccupationsPage) },
   { path: 'audit', canActivate: [authGuard, reviewGuard], loadComponent: () => import('../pages/audit.page').then(module => module.AuditPage) },
   { path: '', pathMatch: 'full', redirectTo: 'workers' },
   { path: '**', redirectTo: 'workers' },

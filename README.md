@@ -48,6 +48,8 @@ docker compose down -v --remove-orphans
 - 不可变更正：原值禁止覆盖；一次更正事务创建负值 reversal 和新 replacement，完整保留链路。
 - 作业计划：使用统一 mSv/mSv/h 单位维护剂量率、分钟数和具体控制措施。
 - 剂量评估：冻结人员/计划版本、期间记录 ID、公式、阈值版本和控制措施，结果追加写入而非覆盖。
+- 预算占用与释放台：规划员**提交**评估时按计划新增剂量（`rate×minutes÷60`）占用人员期间预算；RPO **接受**后保留，**拒绝**或计划**归档**后释放。同一评估仅占用一次（唯一索引兜底），占用与评估/计划状态在同一事务内变化，失败整体回滚。超行政值或法规值只产生人工复核提示，不生成作业许可。
+- 人员预算余额视图：同一人员的已核验剂量、有效占用、已承诺剂量和行政/法规剩余额度合并在一个只读视图中。
 - 情景比较：对同一人员的多个计划做时间加权投影并比较风险带，不落库、不改变状态。
 - 人工状态机：`draft -> assessed -> pending_rpo_review -> planning_accepted | rejected -> archived`。
 - 操作审计：记录 request ID、操作者、参数摘要与前后状态；普通 API 不提供删除能力。
@@ -101,7 +103,7 @@ docker compose down -v --remove-orphans
 │   ├── api/                        # 按实体拆分 API 客户端
 │   ├── components/common/          # 风险带、证据、安全边界
 │   ├── hooks/                      # useAuth、useBudgetAssessment
-│   ├── pages/                      # workers/plans/exposures/budgets/audit
+│   ├── pages/                      # workers/plans/exposures/budgets/occupations/audit
 │   ├── router/                     # 登录、认证与 RPO 守卫
 │   ├── stores/                     # 按领域拆分信号状态
 │   ├── types/                      # 前端共享枚举和实体
@@ -127,8 +129,11 @@ docker compose down -v --remove-orphans
 | POST | `/exposures/:id/correct` | RPO 创建不可变 reversal/replacement 链 |
 | GET/POST | `/assessments[/:id]` | 列表、详情和不可变评估 |
 | POST | `/assessments/compare` | 同一人员多计划情景比较 |
-| POST | `/assessments/:id/submit` | 提交 RPO 人工复核 |
-| POST | `/assessments/:id/review` | RPO 记录规划接受或拒绝 |
+| POST | `/assessments/:id/submit` | 提交 RPO 人工复核，同时按计划新增剂量占用预算（同一评估仅一次） |
+| POST | `/assessments/:id/review` | RPO 记录规划接受（保留占用）或拒绝（释放占用） |
+| GET | `/budget-occupations` | 占用/保留/释放台账（可按 `worker_id`、`plan_id`、`status` 过滤） |
+| GET | `/budget-occupations/:id` | 单条占用变化记录 |
+| GET | `/budget-occupations/worker-balances` | 同一人员已核验剂量、有效占用、已承诺与剩余额度单一视图 |
 | GET | `/audit` | RPO/admin 查询审计 |
 
 错误统一为 `error.code`、`error.message` 和 `request_id`。常见冲突包括 `duplicate_source_ref`、`correction_chain_conflict`、`invalid_state`、`version_conflict` 和 `forbidden`。
@@ -153,7 +158,19 @@ docker compose down -v --remove-orphans
 - 数据库/model：`backend/internal/model/dose_budget_assessment.go`
 - 后端常量/算法：`backend/internal/constants/dose.go`、`backend/internal/dosebudget/threshold.go`
 - 后端 DTO/service/handler：`backend/internal/dto/dose_budget_assessment.go`、`backend/internal/service/dose_budget_assessment.go`、`backend/internal/handler/dose_budget_assessment.go`
-- 前端类型/store/component/page：`frontend/src/app/types/dose.ts`、`stores/budget.store.ts`、`components/common/dose-band-badge.component.ts`、`components/common/budget-evidence-panel.component.ts`、`pages/budgets.page.ts`、`pages/audit.page.ts`
+- 前端类型/store/component/page：`frontend/src/app/types/dose.ts`、`stores/budget.store.ts`、`components/common/dose-band-badge.component.ts`、`components/common/budget-evidence-panel.component.ts`、`pages/budgets.page.ts`、`pages/audit.page.ts`、`pages/occupations.page.ts`
+
+### OccupationStatus
+
+值：`occupied | retained | released`（`released` 为终态）。占用随评估提交创建，接受后 `retained`，拒绝或归档后 `released`，`release_reason` 为 `review_rejected | plan_archived`。
+
+- 数据库/model：`backend/internal/model/budget_occupation.go`（`assessment_id` 唯一索引，保证同一评估仅占用一次）
+- 后端常量/状态机/算法：`backend/internal/constants/dose.go`（`CanTransitionOccupation`）、`backend/internal/dosebudget/occupation.go`
+- 后端 repository/service/handler/router：`backend/internal/repository/budget_occupation.go`、`backend/internal/service/budget_occupation.go`、`backend/internal/handler/budget_occupation.go`、`backend/internal/router/budget_occupation.go`
+- 事务接入点：`backend/internal/service/dose_budget_assessment.go`（Submit 占用、Review 保留/释放）、`backend/internal/service/work_permit_plan.go`（Archive 释放）
+- 前端类型/api/store/page：`frontend/src/app/types/occupation.ts`、`api/occupations.api.ts`、`stores/occupations.store.ts`、`pages/occupations.page.ts`
+
+审计动作：`budget.occupied`、`budget.retained`、`budget.released`，均在对应业务事务内写入，可通过 `GET /audit?resource_type=budget_occupation` 或按 action 回看占用变化。
 
 ## 环境变量
 
@@ -197,7 +214,7 @@ npm --prefix frontend run build
 scripts/api_smoke.sh
 ```
 
-脚本会创建带低阈值的隔离测试人员，并验证重复来源、核验、更正链、投影、超阈值、比较、状态机、RBAC 和审计。
+脚本会创建带低阈值的隔离测试人员，并验证重复来源、核验、更正链、投影、超阈值、比较、状态机、RBAC、审计，以及预算占用的「提交占用 → 接受保留 / 拒绝释放 → 归档释放」完整链路、同一评估仅占用一次和人员余额单一视图。
 
 ## 安全与隐私边界
 

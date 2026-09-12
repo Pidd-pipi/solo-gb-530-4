@@ -5,6 +5,8 @@ import (
 	"strings"
 	"time"
 
+	"gorm.io/gorm"
+
 	"radiation-dose-budget-control/backend/internal/constants"
 	"radiation-dose-budget-control/backend/internal/dto"
 	"radiation-dose-budget-control/backend/internal/model"
@@ -12,19 +14,26 @@ import (
 )
 
 type WorkPermitPlanService struct {
+	db          *gorm.DB
 	plans       *repository.WorkPermitPlanRepository
 	workers     *repository.WorkerProfileRepository
 	assessments *repository.DoseBudgetAssessmentRepository
+	occupations *BudgetOccupationService
 	audit       *AuditService
 }
 
 func NewWorkPermitPlanService(
+	db *gorm.DB,
 	plans *repository.WorkPermitPlanRepository,
 	workers *repository.WorkerProfileRepository,
 	assessments *repository.DoseBudgetAssessmentRepository,
+	occupations *BudgetOccupationService,
 	audit *AuditService,
 ) *WorkPermitPlanService {
-	return &WorkPermitPlanService{plans: plans, workers: workers, assessments: assessments, audit: audit}
+	return &WorkPermitPlanService{
+		db: db, plans: plans, workers: workers, assessments: assessments,
+		occupations: occupations, audit: audit,
+	}
 }
 
 func (service *WorkPermitPlanService) Create(request dto.CreateWorkPermitPlanRequest, actor dto.Actor, requestID string) (dto.WorkPermitPlanResponse, error) {
@@ -136,30 +145,44 @@ func (service *WorkPermitPlanService) List(page, pageSize int, status, workerFil
 }
 
 func (service *WorkPermitPlanService) Archive(id uint, request dto.PlanVersionRequest, actor dto.Actor, requestID string) (dto.WorkPermitPlanResponse, error) {
-	before, err := service.plans.Find(id)
+	var response dto.WorkPermitPlanResponse
+	err := service.db.Transaction(func(tx *gorm.DB) error {
+		plans := service.plans.WithDB(tx)
+		before, err := plans.FindForUpdate(id)
+		if err != nil {
+			return MapRepositoryError("work permit plan", err)
+		}
+		if !constants.CanTransitionPermit(before.PermitStatus, constants.PermitStatusArchived) {
+			return Conflict("invalid_state", "only reviewed plans can be archived", nil)
+		}
+		now := time.Now().UTC()
+		if err := plans.Transition(id, request.Version, before.PermitStatus, constants.PermitStatusArchived, map[string]any{"archived_at": now}); err != nil {
+			return Conflict("version_conflict", "plan changed before archive", err)
+		}
+		// Archival releases any still-active occupation (accepted plans
+		// retain until archived; rejected plans were already released).
+		if _, _, err := service.occupations.ReleaseOnArchive(tx, id, actor, requestID); err != nil {
+			return err
+		}
+		after := before
+		after.PermitStatus = constants.PermitStatusArchived
+		after.Version = request.Version + 1
+		after.ArchivedAt = &now
+		if err := service.audit.RecordTx(tx, actor, requestID, "plan.archived", "work_permit_plan", auditID(id),
+			map[string]any{"expected_version": request.Version}, planAudit(before), planAudit(after)); err != nil {
+			return err
+		}
+		worker, err := service.workers.WithDB(tx).Find(after.WorkerID)
+		if err != nil {
+			return MapRepositoryError("plan worker", err)
+		}
+		response = planResponse(after, worker)
+		return nil
+	})
 	if err != nil {
-		return dto.WorkPermitPlanResponse{}, MapRepositoryError("work permit plan", err)
-	}
-	if !constants.CanTransitionPermit(before.PermitStatus, constants.PermitStatusArchived) {
-		return dto.WorkPermitPlanResponse{}, Conflict("invalid_state", "only reviewed plans can be archived", nil)
-	}
-	now := time.Now().UTC()
-	if err := service.plans.Transition(id, request.Version, before.PermitStatus, constants.PermitStatusArchived, map[string]any{"archived_at": now}); err != nil {
-		return dto.WorkPermitPlanResponse{}, Conflict("version_conflict", "plan changed before archive", err)
-	}
-	after := before
-	after.PermitStatus = constants.PermitStatusArchived
-	after.Version = request.Version + 1
-	after.ArchivedAt = &now
-	if err := service.audit.Record(actor, requestID, "plan.archived", "work_permit_plan", auditID(id),
-		map[string]any{"expected_version": request.Version}, planAudit(before), planAudit(after)); err != nil {
 		return dto.WorkPermitPlanResponse{}, err
 	}
-	worker, err := service.workers.Find(after.WorkerID)
-	if err != nil {
-		return dto.WorkPermitPlanResponse{}, MapRepositoryError("plan worker", err)
-	}
-	return planResponse(after, worker), nil
+	return response, nil
 }
 
 func normalizeControls(values []string) (string, error) {

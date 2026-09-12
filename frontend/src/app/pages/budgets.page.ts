@@ -5,6 +5,7 @@ import { MatButtonModule } from '@angular/material/button';
 import { MatFormFieldModule } from '@angular/material/form-field';
 import { MatInputModule } from '@angular/material/input';
 import { MatSelectModule } from '@angular/material/select';
+import { RouterModule } from '@angular/router';
 import { finalize } from 'rxjs';
 import { useBudgetAssessment } from '../hooks/use-budget-assessment';
 import { PlansStore } from '../stores/plans.store';
@@ -18,7 +19,7 @@ import { apiErrorMessage, inputToUTC, utcNowInput } from '../utils/api-error';
   standalone: true,
   imports: [
     CommonModule, ReactiveFormsModule, MatButtonModule, MatFormFieldModule, MatInputModule,
-    MatSelectModule, BudgetEvidencePanelComponent, DoseBandBadgeComponent, SafetyBoundaryBannerComponent,
+    MatSelectModule, RouterModule, BudgetEvidencePanelComponent, DoseBandBadgeComponent, SafetyBoundaryBannerComponent,
   ],
   template: `
     <div class="page">
@@ -57,7 +58,9 @@ import { apiErrorMessage, inputToUTC, utcNowInput } from '../utils/api-error';
           <div class="review-row">
             <div><strong>{{ selected.assessment_status.replaceAll('_', ' ') }}</strong><span>Calculated {{ selected.created_at | date:'medium':'UTC' }}</span></div>
             <button *ngIf="auth.canPlan() && selected.assessment_status === 'calculated'" mat-flat-button color="primary" (click)="submit(selected.id, selected.plan_version)">Submit to RPO review</button>
-            <span *ngIf="selected.assessment_status === 'submitted'" class="waiting">Awaiting independent RPO review</span>
+            <span *ngIf="selected.assessment_status === 'submitted'" class="waiting">Awaiting independent RPO review · 计划剂量已占用人员预算</span>
+            <span *ngIf="selected.assessment_status === 'accepted'" class="retained">RPO 接受：预算占用已保留（仅规划证据，非现场许可）· <a routerLink="/occupations">前往预算占用台</a></span>
+            <span *ngIf="selected.assessment_status === 'rejected'" class="released">RPO 拒绝：预算占用已释放 · <a routerLink="/occupations">查看台账</a></span>
           </div>
         </div>
       </div>
@@ -79,6 +82,9 @@ import { apiErrorMessage, inputToUTC, utcNowInput } from '../utils/api-error';
     .review-row { display: flex; justify-content: space-between; align-items: center; gap: 18px; margin-top: 10px; padding: 14px 16px; border: 1px solid var(--line); background: #fbfbf7; }
     .review-row strong, .review-row span { display: block; } .review-row strong { text-transform: capitalize; } .review-row span { margin-top: 3px; color: var(--muted); font-size: 11px; }
     .waiting { color: #76510b !important; font-weight: 700; }
+    .retained { color: #185847 !important; font-weight: 700; }
+    .released { color: var(--muted) !important; font-weight: 700; }
+    .retained a { text-decoration: underline; }
     @media (max-width: 980px) { .assessment-bar, .comparison-bar { grid-template-columns: 1fr 1fr; } .assessment-bar > div, .comparison-bar .eyebrow { grid-column: 1 / -1; } }
     @media (max-width: 620px) { .assessment-bar, .comparison-bar { grid-template-columns: 1fr; } .review-row { align-items: stretch; flex-direction: column; } }
   `],

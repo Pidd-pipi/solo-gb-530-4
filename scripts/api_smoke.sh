@@ -80,25 +80,62 @@ plan_version="$(jq -r '.data.version' <<<"$last_body")"
 request "create comparison plan" 201 POST "/plans" "$planner_token" "$(jq -nc --argjson worker "$worker_id" '{plan_code:"QA-ALARA-530-LO",worker_id:$worker,work_area:"QA controlled bay",task_category:"Remote survey",estimated_rate_msvh:0.1,planned_minutes:30,controls:["distance markers","remote reading"]}')"
 comparison_plan_id="$(jq -r '.data.id' <<<"$last_body")"
 
-period_end="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-request "calculate immutable assessment" 201 POST "/assessments" "$planner_token" "$(jq -nc --argjson plan "$plan_id" --argjson version "$plan_version" --arg end "$period_end" '{plan_id:$plan,period_end:$end,version:$version}')"
+period_end="$(date -u -d '+1 minute' +'%Y-%m-%dT%H:%M:%SZ')"
+request "calculate immutable assessment" 201 POST "/assessments" "$planner_token" "$(jq -nc --argjson plan "$plan_id" --argjson version "$plan_version" --arg period_end "$period_end" '{plan_id:$plan,period_end:$period_end,version:$version}')"
 assessment_id="$(jq -r '.data.id' <<<"$last_body")"
 assessed_version="$(jq -r '.data.plan_version' <<<"$last_body")"
 require_json '.data.period_dose_msv == 0.3 and .data.projected_dose_msv == 1.8 and .data.risk_band == "above_legal" and .data.evidence.requires_manual_review == true' "corrected total, projection and threshold escalation"
 
-request "compare two time-weighted scenarios" 200 POST "/assessments/compare" "$planner_token" "$(jq -nc --argjson first "$plan_id" --argjson second "$comparison_plan_id" --arg end "$period_end" '{plan_ids:[$first,$second],period_end:$end}')"
+request "compare two time-weighted scenarios" 200 POST "/assessments/compare" "$planner_token" "$(jq -nc --argjson first "$plan_id" --argjson second "$comparison_plan_id" --arg period_end "$period_end" '{plan_ids:[$first,$second],period_end:$period_end}')"
 require_json '.data.scenarios | length == 2' "two comparison scenarios"
 
 request "submit assessment to RPO" 200 POST "/assessments/$assessment_id/submit" "$planner_token" "$(jq -nc --argjson version "$assessed_version" '{version:$version}')"
 review_version="$(jq -r '.data.plan_version' <<<"$last_body")"
 require_json '.data.assessment_status == "submitted"' "assessment submitted"
 
+request "duplicate submission rejected" 409 POST "/assessments/$assessment_id/submit" "$planner_token" "$(jq -nc --argjson version "$review_version" '{version:$version}')"
+
+request "occupation created on submit" 200 GET "/budget-occupations?plan_id=$plan_id" "$planner_token"
+require_json '(.data | length) == 1 and .data[0].occupation_status == "occupied" and .data[0].dose_msv == 1.5 and .data[0].period_dose_msv == 0.3' "single occupation of 1.5 mSv"
+occupation_id="$(jq -r '.data[0].id' <<<"$last_body")"
+require_json ".data[0].assessment_id == $assessment_id and .data[0].planning_only == true and .data[0].automatic_work_permit == false" "occupation never implies a work permit"
+
+request "worker balance unifies verified and occupied dose" 200 GET "/budget-occupations/worker-balances" "$planner_token"
+require_json "([.data[] | select(.worker_id == $worker_id)][0] | .verified_dose_msv == 0.3 and .active_occupation_msv == 1.5 and .committed_dose_msv == 1.8 and .active_occupation_count == 1 and .risk_band == \"above_legal\" and .requires_manual_review == true and .automatic_work_permit == false)" "over-limit occupation only flags manual review"
+
 request "planner cannot perform RPO review" 403 POST "/assessments/$assessment_id/review" "$planner_token" "$(jq -nc --argjson version "$review_version" '{version:$version,decision:"accept",note:"planner must not review"}')"
 
 request "RPO records planning acceptance" 200 POST "/assessments/$assessment_id/review" "$rpo_token" "$(jq -nc --argjson version "$review_version" '{version:$version,decision:"accept",note:"Planning evidence independently reviewed; site permit remains separate."}')"
 require_json '.data.assessment_status == "accepted" and .data.risk_band == "above_legal"' "human review records decision without changing risk"
+accepted_version="$(jq -r '.data.plan_version' <<<"$last_body")"
+
+request "occupation retained after acceptance" 200 GET "/budget-occupations/$occupation_id" "$rpo_token"
+require_json '.data.occupation_status == "retained" and .data.dose_msv == 1.5 and .data.retained_by != null and .data.released_at == null' "accepted occupation is retained, not released"
 
 request "duplicate review rejected" 409 POST "/assessments/$assessment_id/review" "$rpo_token" "$(jq -nc --argjson version "$review_version" '{version:$version,decision:"reject",note:"duplicate state transition"}')"
+
+request "archive accepted plan releases retained occupation" 200 POST "/plans/$plan_id/archive" "$planner_token" "$(jq -nc --argjson version "$accepted_version" '{version:$version}')"
+request "occupation released after archival" 200 GET "/budget-occupations/$occupation_id" "$planner_token"
+require_json '.data.occupation_status == "released" and .data.release_reason == "plan_archived" and .data.released_by != null' "archival releases retained occupation"
+
+# Rejection branch: a second plan for the same worker is submitted and rejected.
+request "calculate second assessment" 201 POST "/assessments" "$planner_token" "$(jq -nc --argjson plan "$comparison_plan_id" --argjson version 1 --arg period_end "$period_end" '{plan_id:$plan,period_end:$period_end,version:$version}')"
+second_assessment_id="$(jq -r '.data.id' <<<"$last_body")"
+second_assessed_version="$(jq -r '.data.plan_version' <<<"$last_body")"
+request "submit second assessment" 200 POST "/assessments/$second_assessment_id/submit" "$planner_token" "$(jq -nc --argjson version "$second_assessed_version" '{version:$version}')"
+second_review_version="$(jq -r '.data.plan_version' <<<"$last_body")"
+request "second occupation occupies 0.05 mSv" 200 GET "/budget-occupations?plan_id=$comparison_plan_id" "$planner_token"
+require_json '(.data | length) == 1 and .data[0].occupation_status == "occupied" and .data[0].dose_msv == 0.05' "second plan occupies its planned increment once"
+second_occupation_id="$(jq -r '.data[0].id' <<<"$last_body")"
+request "RPO rejects second assessment" 200 POST "/assessments/$second_assessment_id/review" "$rpo_token" "$(jq -nc --argjson version "$second_review_version" '{version:$version,decision:"reject",note:"Planning scenario rejected by independent RPO review."}')"
+request "occupation released after rejection" 200 GET "/budget-occupations/$second_occupation_id" "$planner_token"
+require_json '.data.occupation_status == "released" and .data.release_reason == "review_rejected"' "rejection releases occupation"
+
+request "balance returns released budget" 200 GET "/budget-occupations/worker-balances" "$planner_token"
+require_json "([.data[] | select(.worker_id == $worker_id)][0] | .active_occupation_msv == 0 and .active_occupation_count == 0 and .committed_dose_msv == 0.3 and .verified_dose_msv == 0.3)" "released occupations return budget to the worker"
+
+request "occupation changes are auditable" 200 GET "/audit?page_size=100&resource_type=budget_occupation" "$rpo_token"
+require_json '([.data[].action] | sort | unique) == ["budget.occupied","budget.released","budget.retained"]' "occupied retained and released events in audit"
 
 request "audit visible to RPO" 200 GET "/audit?page_size=100" "$rpo_token"
 require_json '(.data | length) >= 8 and ([.data[].action] | index("assessment.reviewed")) != null' "audit contains reviewed transition"

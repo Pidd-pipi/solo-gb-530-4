@@ -21,6 +21,7 @@ type DoseBudgetAssessmentService struct {
 	plans            *repository.WorkPermitPlanRepository
 	workers          *repository.WorkerProfileRepository
 	entries          *repository.ExposureEntryRepository
+	occupations      *BudgetOccupationService
 	audit            *AuditService
 	nearRatio        float64
 	thresholdVersion string
@@ -32,12 +33,14 @@ func NewDoseBudgetAssessmentService(
 	plans *repository.WorkPermitPlanRepository,
 	workers *repository.WorkerProfileRepository,
 	entries *repository.ExposureEntryRepository,
+	occupations *BudgetOccupationService,
 	audit *AuditService,
 	nearRatio float64,
 	thresholdVersion string,
 ) *DoseBudgetAssessmentService {
 	return &DoseBudgetAssessmentService{
-		db: db, assessments: assessments, plans: plans, workers: workers, entries: entries, audit: audit,
+		db: db, assessments: assessments, plans: plans, workers: workers, entries: entries,
+		occupations: occupations, audit: audit,
 		nearRatio: nearRatio, thresholdVersion: thresholdVersion,
 	}
 }
@@ -170,6 +173,7 @@ func (service *DoseBudgetAssessmentService) Submit(
 	err := service.db.Transaction(func(tx *gorm.DB) error {
 		assessments := service.assessments.WithDB(tx)
 		plans := service.plans.WithDB(tx)
+		workers := service.workers.WithDB(tx)
 		assessment, err := assessments.FindForUpdate(id)
 		if err != nil {
 			return MapRepositoryError("dose budget assessment", err)
@@ -201,14 +205,20 @@ func (service *DoseBudgetAssessmentService) Submit(
 		plan.PermitStatus = constants.PermitStatusPendingRPOReview
 		plan.Version++
 		assessment.AssessmentStatus = constants.AssessmentStatusSubmitted
+		worker, err := workers.Find(plan.WorkerID)
+		if err != nil {
+			return MapRepositoryError("assessment worker", err)
+		}
+		// Submission occupies the planned dose against the worker's period
+		// budget exactly once for this assessment. Same transaction: any
+		// failure here rolls back both the state transitions and the audit.
+		if _, err := service.occupations.OccupyOnSubmit(tx, assessment, plan, worker, actor, requestID); err != nil {
+			return err
+		}
 		if err := service.audit.RecordTx(tx, actor, requestID, "assessment.submitted", "dose_budget_assessment", auditID(id),
 			map[string]any{"expected_plan_version": request.Version, "destination": "rpo_human_review"},
 			planAudit(beforePlan), planAudit(plan)); err != nil {
 			return err
-		}
-		worker, err := service.workers.WithDB(tx).Find(plan.WorkerID)
-		if err != nil {
-			return MapRepositoryError("assessment worker", err)
 		}
 		response = assessmentResponse(assessment, plan, worker)
 		return nil
@@ -262,6 +272,18 @@ func (service *DoseBudgetAssessmentService) Review(
 		if err := plans.Transition(plan.ID, plan.Version, constants.PermitStatusPendingRPOReview, targetPlanStatus,
 			map[string]any{"reviewer_id": actor.ID, "review_note": strings.TrimSpace(request.Note)}); err != nil {
 			return Conflict("version_conflict", "plan changed before review was committed", err)
+		}
+		// Acceptance retains the occupation; rejection releases it. Both run
+		// in this transaction, so the review outcome and the ledger can never
+		// diverge.
+		if request.Decision == "accept" {
+			if _, err := service.occupations.RetainOnAccept(tx, assessment.ID, actor, requestID); err != nil {
+				return err
+			}
+		} else {
+			if _, err := service.occupations.ReleaseOnReject(tx, assessment.ID, constants.OccupationReleaseReviewRejected, actor, requestID); err != nil {
+				return err
+			}
 		}
 		beforePlan := plan
 		plan.PermitStatus = targetPlanStatus
