@@ -202,6 +202,8 @@ go test -race ./backend/...
 
 npm --prefix frontend ci
 npm --prefix frontend run typecheck
+npm --prefix frontend run typecheck:spec
+npm --prefix frontend test
 npm --prefix frontend run build
 
 
@@ -215,6 +217,8 @@ scripts/api_smoke.sh
 ```
 
 脚本会创建带低阈值的隔离测试人员，并验证重复来源、核验、更正链、投影、超阈值、比较、状态机、RBAC、审计，以及预算占用的「提交占用 → 接受保留 / 拒绝释放 → 归档释放」完整链路、同一评估仅占用一次和人员余额单一视图。
+
+`npm test` 运行预算占用台的页面状态测试（Node 内置 test runner，esbuild 打包，无需浏览器）：用可控时序的模拟 HTTP 驱动真实 store，覆盖首次加载只显示选中人员明细、连续切换人员时旧响应不能覆盖、状态筛选切换结果一致，以及余额加载失败不清空已有有效明细。
 
 ## 安全与隐私边界
 

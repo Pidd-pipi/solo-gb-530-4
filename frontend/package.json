@@ -5,7 +5,9 @@
   "scripts": {
     "start": "ng serve --host 0.0.0.0 --port 4200",
     "build": "ng build --configuration production",
-    "typecheck": "tsc --noEmit -p tsconfig.app.json"
+    "typecheck": "tsc --noEmit -p tsconfig.app.json",
+    "typecheck:spec": "tsc --noEmit -p tsconfig.spec.json",
+    "test": "node scripts/run-store-tests.mjs"
   },
   "dependencies": {
     "@angular/animations": "17.3.12",
@@ -26,6 +28,8 @@
     "@angular-devkit/build-angular": "17.3.11",
     "@angular/cli": "17.3.11",
     "@angular/compiler-cli": "17.3.12",
+    "@types/node": "^20.19.43",
+    "esbuild": "^0.20.1",
     "typescript": "5.4.5"
   }
 }
