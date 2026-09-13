@@ -81,24 +81,68 @@ func (service *BudgetOccupationService) OccupyOnSubmit(
 		return model.BudgetOccupation{}, Internal("could not create budget occupation", err)
 	}
 	// Over-limit scenarios only flag human review: occupation is still
-	// recorded and no work permit or authorization is produced.
-	balance, err := dosebudget.BuildWorkerBalance(
-		input.WorkerID, worker.AdministrativeLimitMSV, worker.AnnualLimitMSV,
-		input.PeriodDoseMSV, input.DoseMSV, 1, service.nearRatio, service.thresholdVersion,
-	)
+	// recorded and no work permit or authorization is produced. The frozen
+	// risk evidence is computed from ALL active occupations (including the
+	// row just inserted) plus the worker's verified period dose, so a single
+	// submission, concurrent occupations and post-release submissions all
+	// match the worker balance view — never just this row's dose.
+	balance, _, err := service.buildBalance(tx, worker)
 	if err != nil {
-		return model.BudgetOccupation{}, BadRequest("invalid_thresholds", err.Error())
+		return model.BudgetOccupation{}, err
 	}
 	if err := service.audit.RecordTx(tx, actor, requestID, "budget.occupied", "budget_occupation", auditID(occupation.ID),
 		map[string]any{
 			"assessment_id": assessment.ID, "plan_id": plan.ID, "worker_id": plan.WorkerID,
 			"occupied_dose_msv": occupation.DoseMSV, "period_dose_msv": occupation.PeriodDoseMSV,
-			"risk_band": balance.RiskBand, "requires_manual_review": balance.RequiresManualReview,
+			"verified_dose_msv":       balance.VerifiedDoseMSV,
+			"active_occupation_msv":   balance.ActiveOccupationMSV,
+			"active_occupation_count": balance.ActiveOccupationCount,
+			"committed_dose_msv":      balance.CommittedDoseMSV,
+			"risk_band":               balance.RiskBand, "requires_manual_review": balance.RequiresManualReview,
 			"planning_only": true, "automatic_work_permit": false,
 		}, nil, occupationAudit(occupation)); err != nil {
 		return model.BudgetOccupation{}, err
 	}
 	return occupation, nil
+}
+
+// buildBalance assembles one worker's budget view with the exact same rule as
+// WorkerBalances: verified period dose plus every non-released occupation.
+// When tx is non-nil the read participates in that transaction, so a
+// submission sees the occupation row it just inserted.
+func (service *BudgetOccupationService) buildBalance(tx *gorm.DB, worker model.WorkerProfile) (dosebudget.WorkerBudgetBalance, []uint, error) {
+	workers := service.workers
+	occupations := service.occupations
+	if tx != nil {
+		workers = workers.WithDB(tx)
+		occupations = occupations.WithDB(tx)
+	}
+	period, err := dosebudget.NewPeriod(worker.PeriodStart, time.Now().UTC())
+	if err != nil {
+		return dosebudget.WorkerBudgetBalance{}, nil, BadRequest("invalid_period", err.Error())
+	}
+	verifiedDose, err := workers.PeriodDose(worker.ID, period.Start, period.End)
+	if err != nil {
+		return dosebudget.WorkerBudgetBalance{}, nil, Internal("could not summarize verified dose", err)
+	}
+	active, err := occupations.ActiveByWorker(worker.ID)
+	if err != nil {
+		return dosebudget.WorkerBudgetBalance{}, nil, Internal("could not summarize active occupations", err)
+	}
+	var activeDose float64
+	activeIDs := make([]uint, 0, len(active))
+	for _, occupation := range active {
+		activeDose += occupation.DoseMSV
+		activeIDs = append(activeIDs, occupation.ID)
+	}
+	balance, err := dosebudget.BuildWorkerBalance(
+		worker.ID, worker.AdministrativeLimitMSV, worker.AnnualLimitMSV,
+		verifiedDose, activeDose, len(active), service.nearRatio, service.thresholdVersion,
+	)
+	if err != nil {
+		return dosebudget.WorkerBudgetBalance{}, nil, BadRequest("invalid_thresholds", err.Error())
+	}
+	return balance, activeIDs, nil
 }
 
 // RetainOnAccept keeps the occupation after an RPO acceptance. Caller already
@@ -285,38 +329,11 @@ func (service *BudgetOccupationService) WorkerBalances(page, pageSize int, statu
 	if err != nil {
 		return nil, dto.PageMeta{}, Internal("could not list worker profiles", err)
 	}
-	workerIDs := make([]uint, 0, len(workers))
-	for _, worker := range workers {
-		workerIDs = append(workerIDs, worker.ID)
-	}
-	activeByWorker, err := service.occupations.ActiveByWorkers(workerIDs)
-	if err != nil {
-		return nil, dto.PageMeta{}, Internal("could not summarize active occupations", err)
-	}
-	now := time.Now().UTC()
 	responses := make([]dto.WorkerBudgetBalanceResponse, 0, len(workers))
 	for _, worker := range workers {
-		period, err := dosebudget.NewPeriod(worker.PeriodStart, now)
+		balance, activeIDs, err := service.buildBalance(nil, worker)
 		if err != nil {
-			return nil, dto.PageMeta{}, BadRequest("invalid_period", err.Error())
-		}
-		verifiedDose, err := service.workers.PeriodDose(worker.ID, period.Start, period.End)
-		if err != nil {
-			return nil, dto.PageMeta{}, Internal("could not summarize verified dose", err)
-		}
-		active := activeByWorker[worker.ID]
-		var activeDose float64
-		activeIDs := make([]uint, 0, len(active))
-		for _, occupation := range active {
-			activeDose += occupation.DoseMSV
-			activeIDs = append(activeIDs, occupation.ID)
-		}
-		balance, err := dosebudget.BuildWorkerBalance(
-			worker.ID, worker.AdministrativeLimitMSV, worker.AnnualLimitMSV,
-			verifiedDose, activeDose, len(active), service.nearRatio, service.thresholdVersion,
-		)
-		if err != nil {
-			return nil, dto.PageMeta{}, BadRequest("invalid_thresholds", err.Error())
+			return nil, dto.PageMeta{}, err
 		}
 		responses = append(responses, dto.WorkerBudgetBalanceResponse{
 			WorkerID: worker.ID, WorkerCode: worker.WorkerCode, WorkerName: worker.DisplayName,

@@ -99,24 +99,6 @@ func (repository *BudgetOccupationRepository) ActiveByWorker(workerID uint) ([]m
 	return occupations, nil
 }
 
-// ActiveByWorkers batches the active occupations for several workers in one
-// query, keyed by worker id.
-func (repository *BudgetOccupationRepository) ActiveByWorkers(workerIDs []uint) (map[uint][]model.BudgetOccupation, error) {
-	result := map[uint][]model.BudgetOccupation{}
-	if len(workerIDs) == 0 {
-		return result, nil
-	}
-	var occupations []model.BudgetOccupation
-	if err := repository.db.Where("worker_id IN ? AND occupation_status <> ?", workerIDs, "released").
-		Order("occupied_at ASC, id ASC").Find(&occupations).Error; err != nil {
-		return nil, fmt.Errorf("list active occupations: %w", err)
-	}
-	for _, occupation := range occupations {
-		result[occupation.WorkerID] = append(result[occupation.WorkerID], occupation)
-	}
-	return result, nil
-}
-
 // Retain moves an occupied row to retained with a conditional update. The
 // caller already holds the row lock via FindForUpdate; exactly one row must
 // change.

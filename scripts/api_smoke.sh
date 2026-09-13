@@ -134,6 +134,31 @@ require_json '.data.occupation_status == "released" and .data.release_reason == 
 request "balance returns released budget" 200 GET "/budget-occupations/worker-balances" "$planner_token"
 require_json "([.data[] | select(.worker_id == $worker_id)][0] | .active_occupation_msv == 0 and .active_occupation_count == 0 and .committed_dose_msv == 0.3 and .verified_dose_msv == 0.3)" "released occupations return budget to the worker"
 
+# Multi-occupation audit: two plans whose individual increments stay within the
+# 0.5 mSv admin limit (0.2 each) push committed dose to 0.7 when both are
+# active. The second occupation's audit must reflect ALL active occupations,
+# not just its own dose.
+request "create multi plan one" 201 POST "/plans" "$planner_token" "$(jq -nc --argjson worker "$worker_id" '{plan_code:"QA-ALARA-530-M1",worker_id:$worker,work_area:"QA controlled bay",task_category:"Concurrent survey one",estimated_rate_msvh:0.2,planned_minutes:60,controls:["distance markers"]}')"
+multi_plan_one="$(jq -r '.data.id' <<<"$last_body")"
+request "create multi plan two" 201 POST "/plans" "$planner_token" "$(jq -nc --argjson worker "$worker_id" '{plan_code:"QA-ALARA-530-M2",worker_id:$worker,work_area:"QA controlled bay",task_category:"Concurrent survey two",estimated_rate_msvh:0.2,planned_minutes:60,controls:["distance markers"]}')"
+multi_plan_two="$(jq -r '.data.id' <<<"$last_body")"
+
+request "assess multi plan one" 201 POST "/assessments" "$planner_token" "$(jq -nc --argjson plan "$multi_plan_one" --argjson version 1 --arg period_end "$period_end" '{plan_id:$plan,period_end:$period_end,version:$version}')"
+multi_assessment_one="$(jq -r '.data.id' <<<"$last_body")"; multi_v_one="$(jq -r '.data.plan_version' <<<"$last_body")"
+request "submit multi plan one" 200 POST "/assessments/$multi_assessment_one/submit" "$planner_token" "$(jq -nc --argjson version "$multi_v_one" '{version:$version}')"
+request "first occupation audit uses single-dose band" 200 GET "/budget-occupations?plan_id=$multi_plan_one" "$rpo_token"
+multi_occ_one="$(jq -r '.data[0].id' <<<"$last_body")"
+
+request "assess multi plan two" 201 POST "/assessments" "$planner_token" "$(jq -nc --argjson plan "$multi_plan_two" --argjson version 1 --arg period_end "$period_end" '{plan_id:$plan,period_end:$period_end,version:$version}')"
+multi_assessment_two="$(jq -r '.data.id' <<<"$last_body")"; multi_v_two="$(jq -r '.data.plan_version' <<<"$last_body")"
+request "submit multi plan two" 200 POST "/assessments/$multi_assessment_two/submit" "$planner_token" "$(jq -nc --argjson version "$multi_v_two" '{version:$version}')"
+request "second occupation audit uses all-active band" 200 GET "/budget-occupations?plan_id=$multi_plan_two" "$rpo_token"
+multi_occ_two="$(jq -r '.data[0].id' <<<"$last_body")"
+
+request "multi occupation audit bands reflect cumulative budget" 200 GET "/audit?page_size=100&resource_type=budget_occupation&action=budget.occupied" "$rpo_token"
+require_json "([.data[] | select(.resource_id | tostring == \"$multi_occ_two\")][0].parameters | .risk_band == \"above_admin\" and .requires_manual_review == true and .committed_dose_msv == 0.7 and .active_occupation_msv == 0.4 and .active_occupation_count == 2)" "second occupation audit computed from all active occupations"
+require_json "([.data[] | select(.resource_id | tostring == \"$multi_occ_one\")][0].parameters | .risk_band == \"within_admin\" and .requires_manual_review == false and .committed_dose_msv == 0.5 and .active_occupation_msv == 0.2 and .active_occupation_count == 1)" "first occupation audit reflects only its own single active occupation"
+
 request "occupation changes are auditable" 200 GET "/audit?page_size=100&resource_type=budget_occupation" "$rpo_token"
 require_json '([.data[].action] | sort | unique) == ["budget.occupied","budget.released","budget.retained"]' "occupied retained and released events in audit"
 

@@ -170,7 +170,7 @@ docker compose down -v --remove-orphans
 - 事务接入点：`backend/internal/service/dose_budget_assessment.go`（Submit 占用、Review 保留/释放）、`backend/internal/service/work_permit_plan.go`（Archive 释放）
 - 前端类型/api/store/page：`frontend/src/app/types/occupation.ts`、`api/occupations.api.ts`、`stores/occupations.store.ts`、`pages/occupations.page.ts`
 
-审计动作：`budget.occupied`、`budget.retained`、`budget.released`，均在对应业务事务内写入，可通过 `GET /audit?resource_type=budget_occupation` 或按 action 回看占用变化。
+审计动作：`budget.occupied`、`budget.retained`、`budget.released`，均在对应业务事务内写入，可通过 `GET /audit?resource_type=budget_occupation` 或按 action 回看占用变化。`budget.occupied` 冻结的 `risk_band` / `requires_manual_review` 按提交当时该人员**全部有效占用 + 已核验剂量**计算（附带 `verified_dose_msv`、`active_occupation_msv`、`active_occupation_count`、`committed_dose_msv`），因此单笔提交、多笔并存以及释放后再次提交都与人员余额视图一致，而不是只按本笔剂量。
 
 ## 环境变量
 

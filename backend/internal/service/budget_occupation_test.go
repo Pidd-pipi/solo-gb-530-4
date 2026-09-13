@@ -1,6 +1,8 @@
 package service
 
 import (
+	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -346,7 +348,141 @@ func TestReviewRollsBackWhenOccupationMissing(t *testing.T) {
 	}
 }
 
-// TestArchiveRollsBackWhenAuditFails forces the archive transaction to fail at
+func (fixture occupationFixture) occupationByAssessment(t *testing.T, assessmentID uint) model.BudgetOccupation {
+	t.Helper()
+	var occupation model.BudgetOccupation
+	if err := fixture.db.Where("assessment_id = ?", assessmentID).First(&occupation).Error; err != nil {
+		t.Fatalf("load occupation for assessment %d: %v", assessmentID, err)
+	}
+	return occupation
+}
+
+// occupationAuditParameters loads the most recent audit parameters recorded for
+// one occupation action so tests can assert the frozen risk evidence.
+func occupationAuditParameters(t *testing.T, db *gorm.DB, occupationID uint, action string) map[string]any {
+	t.Helper()
+	var event model.AuditEvent
+	if err := db.Where("resource_type = ? AND resource_id = ? AND action = ?", "budget_occupation",
+		fmt.Sprintf("%d", occupationID), action).Order("id DESC").First(&event).Error; err != nil {
+		t.Fatalf("load audit %s for occupation %d: %v", action, occupationID, err)
+	}
+	parameters := map[string]any{}
+	if err := json.Unmarshal([]byte(event.ParametersJSON), &parameters); err != nil {
+		t.Fatalf("decode audit parameters: %v", err)
+	}
+	return parameters
+}
+
+func (fixture occupationFixture) seedPlan(t *testing.T, workerID uint, planCode string, rate float64, minutes int) model.WorkPermitPlan {
+	t.Helper()
+	plan := model.WorkPermitPlan{
+		PlanCode: planCode, WorkerID: workerID, WorkArea: "Multi occupation bay", TaskCategory: "Ledger survey",
+		EstimatedRateMSVH: rate, PlannedMinutes: minutes, ControlsJSON: `["temporary shielding"]`,
+		PermitStatus: constants.PermitStatusDraft, Version: 1, CreatedBy: fixture.planner.ID,
+	}
+	if err := fixture.db.Create(&plan).Error; err != nil {
+		t.Fatalf("create plan %s: %v", planCode, err)
+	}
+	return plan
+}
+
+func (fixture occupationFixture) assessAndSubmit(t *testing.T, plan model.WorkPermitPlan, requestID string) dto.DoseBudgetAssessmentResponse {
+	t.Helper()
+	assessed, err := fixture.assessments.Assess(dto.CreateDoseBudgetAssessmentRequest{
+		PlanID: plan.ID, PeriodEnd: time.Now().UTC(), Version: plan.Version,
+	}, fixture.planner, requestID+"-assess")
+	if err != nil {
+		t.Fatalf("assess plan %s: %v", plan.PlanCode, err)
+	}
+	submitted, err := fixture.assessments.Submit(assessed.ID, dto.PlanVersionRequest{Version: assessed.PlanVersion}, fixture.planner, requestID+"-submit")
+	if err != nil {
+		t.Fatalf("submit plan %s: %v", plan.PlanCode, err)
+	}
+	return submitted
+}
+
+func balanceForWorker(balances []dto.WorkerBudgetBalanceResponse, workerID uint) dto.WorkerBudgetBalanceResponse {
+	for _, candidate := range balances {
+		if candidate.WorkerID == workerID {
+			return candidate
+		}
+	}
+	return dto.WorkerBudgetBalanceResponse{}
+}
+
+// TestMultiOccupationAuditRiskBand reproduces the audit under-reporting: with
+// an existing active occupation, a new submission's audit risk band must be
+// computed from ALL active occupations plus verified dose, matching the worker
+// balance view — for single, concurrent and post-release submissions.
+func TestMultiOccupationAuditRiskBand(t *testing.T) {
+	fixture := newOccupationFixture(t, "file:occupation-multi-band?mode=memory&cache=shared")
+	worker, planA := fixture.seedWorkerPlan(t, "RP-MB-01", "MULTI-A", 2, 1.2, 60, 0)
+	planB := fixture.seedPlan(t, worker.ID, "MULTI-B", 1.0, 60)
+	planC := fixture.seedPlan(t, worker.ID, "MULTI-C", 1.2, 60)
+
+	// First submission stands alone: 1.2 mSv is within the 2 mSv admin limit.
+	submittedA := fixture.assessAndSubmit(t, planA, "req-multi-a")
+	occupationA := fixture.occupationByAssessment(t, submittedA.ID)
+	auditA := occupationAuditParameters(t, fixture.db, occupationA.ID, "budget.occupied")
+	if auditA["risk_band"] != constants.DoseBandWithinAdmin || auditA["requires_manual_review"] != false {
+		t.Fatalf("single occupation audit = band %v review %v, want within_admin/false", auditA["risk_band"], auditA["requires_manual_review"])
+	}
+	balances, _, err := fixture.occupations.WorkerBalances(1, 50, "")
+	if err != nil {
+		t.Fatalf("balances: %v", err)
+	}
+	view := balanceForWorker(balances, worker.ID)
+	if view.RiskBand != constants.DoseBandWithinAdmin || view.CommittedDoseMSV != 1.2 {
+		t.Fatalf("single occupation view = band %s committed %v, want within_admin/1.2", view.RiskBand, view.CommittedDoseMSV)
+	}
+
+	// Second submission while A stays active: combined committed dose is
+	// 2.2 mSv, above the 2 mSv admin limit. The audit must say so even though
+	// plan B's own 1.0 mSv increment is below the limit.
+	submittedB := fixture.assessAndSubmit(t, planB, "req-multi-b")
+	occupationB := fixture.occupationByAssessment(t, submittedB.ID)
+	auditB := occupationAuditParameters(t, fixture.db, occupationB.ID, "budget.occupied")
+	if auditB["risk_band"] != constants.DoseBandAboveAdmin || auditB["requires_manual_review"] != true {
+		t.Fatalf("multi occupation audit = band %v review %v, want above_admin/true", auditB["risk_band"], auditB["requires_manual_review"])
+	}
+	balances, _, _ = fixture.occupations.WorkerBalances(1, 50, "")
+	view = balanceForWorker(balances, worker.ID)
+	if view.RiskBand != constants.DoseBandAboveAdmin || view.ActiveOccupationMSV != 2.2 ||
+		view.CommittedDoseMSV != 2.2 || view.ActiveOccupationCount != 2 || !view.RequiresManualReview {
+		t.Fatalf("multi occupation view = band %s active %v committed %v count %d review %v",
+			view.RiskBand, view.ActiveOccupationMSV, view.CommittedDoseMSV, view.ActiveOccupationCount, view.RequiresManualReview)
+	}
+
+	// Reject A: its occupation is released. With B alone the worker is back
+	// within the admin limit.
+	if _, err := fixture.assessments.Review(submittedA.ID, dto.AssessmentReviewRequest{
+		Decision: "reject", Note: "release first occupation for audit parity test", Version: submittedA.PlanVersion,
+	}, fixture.rpo, "req-multi-reject-a"); err != nil {
+		t.Fatalf("reject A: %v", err)
+	}
+	balances, _, _ = fixture.occupations.WorkerBalances(1, 50, "")
+	view = balanceForWorker(balances, worker.ID)
+	if view.RiskBand != constants.DoseBandWithinAdmin || view.ActiveOccupationMSV != 1.0 || view.ActiveOccupationCount != 1 {
+		t.Fatalf("after release view = band %s active %v count %d, want within_admin/1.0/1",
+			view.RiskBand, view.ActiveOccupationMSV, view.ActiveOccupationCount)
+	}
+
+	// Submit C after a release: released A must not be counted, but active B
+	// plus C (1.0 + 1.2 = 2.2) crosses the admin limit again.
+	submittedC := fixture.assessAndSubmit(t, planC, "req-multi-c")
+	occupationC := fixture.occupationByAssessment(t, submittedC.ID)
+	auditC := occupationAuditParameters(t, fixture.db, occupationC.ID, "budget.occupied")
+	if auditC["risk_band"] != constants.DoseBandAboveAdmin || auditC["requires_manual_review"] != true {
+		t.Fatalf("post-release occupation audit = band %v review %v, want above_admin/true", auditC["risk_band"], auditC["requires_manual_review"])
+	}
+	balances, _, _ = fixture.occupations.WorkerBalances(1, 50, "")
+	view = balanceForWorker(balances, worker.ID)
+	if view.RiskBand != constants.DoseBandAboveAdmin || view.ActiveOccupationMSV != 2.2 || view.ActiveOccupationCount != 2 {
+		t.Fatalf("post-release view = band %s active %v count %d, want above_admin/2.2/2",
+			view.RiskBand, view.ActiveOccupationMSV, view.ActiveOccupationCount)
+	}
+}
+
 // the audit step (audit table dropped) and verifies both the plan transition
 // and the occupation release roll back together.
 func TestArchiveRollsBackWhenAuditFails(t *testing.T) {
