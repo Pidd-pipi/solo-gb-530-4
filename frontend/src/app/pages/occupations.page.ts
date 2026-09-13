@@ -159,8 +159,10 @@ export class OccupationsPage implements OnInit {
   ];
 
   ngOnInit(): void {
+    // A single entry point: balances resolve first, then the store selects the
+    // first worker and loads that worker's detail. No concurrent unfiltered
+    // detail request can overwrite the selected worker's rows.
     this.store.loadBalances();
-    this.store.loadOccupations();
   }
 
   readonly selected = computed<WorkerBudgetBalance | null>(() => {
